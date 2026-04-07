@@ -1,0 +1,15 @@
+[Unit]
+Description=GsCore
+After=network.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=%WORKDIR%
+Environment=PATH=%HOME%/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%UV% run core
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
