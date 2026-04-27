@@ -5,7 +5,7 @@
 """
 
 import asyncio
-from typing import TypeVar, Iterable, Optional, Sequence
+from typing import TypeVar, Optional, Sequence
 from dataclasses import field, dataclass
 from concurrent.futures import ThreadPoolExecutor
 
@@ -30,23 +30,17 @@ async def _run_sync_rerank(
     reranker: TextCrossEncoder,
     query: str,
     texts: list[str],
-) -> Iterable[float]:
-    """在线程池里运行同步 reranker，不阻塞事件循环。
+) -> list[float]:
+    """在线程池里运行同步 reranker，包括完整的 generator 迭代。
 
-    Args:
-        reranker: 具备 rerank(query, texts) 方法的 reranker 实例
-        query: 查询文本
-        texts: 待重排序文本列表
-
-    Returns:
-        重排序分数列表
+    关键：reranker.rerank() 是 generator function，run_in_executor 只把
+    创建 generator 对象的调用放进线程，ONNX 推理发生在迭代时（list()）。
+    必须用 lambda 把 list() 也包进去，否则推理仍在事件循环线程执行。
     """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         _RERANK_EXECUTOR,
-        reranker.rerank,
-        query,
-        texts,
+        lambda: list(reranker.rerank(query, texts)),  # list() 也在线程里执行
     )
 
 

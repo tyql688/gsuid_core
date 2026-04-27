@@ -338,6 +338,9 @@ class HierarchicalGraphBuilder:
                 assignment["indexes"] = [idx + i for idx in original_indexes]
             all_assignments.extend(batch_result)
 
+            # OPT-05: 让出事件循环一个 tick，让 reranker 回调有机会被调度
+            await asyncio.sleep(0)
+
             # 将本批次产生的 Category 名称加入累积列表，供后续批次参考
             for a in batch_result:
                 cat_name = (a["category"] if "category" in a else "").strip()
