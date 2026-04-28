@@ -23,6 +23,21 @@ from .models import AIScheduledTask
 
 TZ_SHANGHAI = timezone("Asia/Shanghai")
 
+
+def _ensure_aware(dt: datetime | None) -> datetime | None:
+    """将 offset-naive datetime 转换为 offset-aware datetime（上海时区）
+
+    数据库中存储的 datetime 通常是 offset-naive 的，而代码中使用
+    datetime.now(TZ_SHANGHAI) 生成的是 offset-aware 的。
+    此函数确保两者可以安全比较。
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=TZ_SHANGHAI)
+    return dt
+
+
 # 安全限制：最大循环执行次数
 MAX_EXECUTION_LIMIT = 10
 
@@ -228,7 +243,8 @@ async def reload_pending_tasks() -> int:
         # 根据任务类型处理
         if task.task_type == "interval":
             # 循环任务
-            if task.next_run_time and task.next_run_time > datetime.now(TZ_SHANGHAI):
+            next_run = _ensure_aware(task.next_run_time)
+            if next_run and next_run > datetime.now(TZ_SHANGHAI):
                 # 重新注册到调度器
                 interval_sec = task.interval_seconds or 0
                 scheduler.add_job(
@@ -249,16 +265,17 @@ async def reload_pending_tasks() -> int:
 
         else:
             # 一次性任务
-            if task.trigger_time and task.trigger_time <= datetime.now(TZ_SHANGHAI):
+            trigger = _ensure_aware(task.trigger_time)
+            if trigger and trigger <= datetime.now(TZ_SHANGHAI):
                 # 立即执行
                 logger.info(f"⏰ [ScheduledTask] 发现已到期的一次性任务，立即执行: {task.task_id}")
                 await execute_scheduled_task(task.task_id)
-            elif task.trigger_time:
+            elif trigger:
                 # 重新注册到调度器
                 scheduler.add_job(
                     func=execute_scheduled_task,
                     trigger="date",
-                    run_date=task.trigger_time,
+                    run_date=trigger,
                     args=[task.task_id],
                     id=task.task_id,
                     replace_existing=True,
