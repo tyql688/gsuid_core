@@ -73,7 +73,10 @@ async def create_subagent(
         # 直接把任务扔给它，它会被 system_prompt 逼着去先列 TODO list
         result = await agent.run(
             user_message=f"【当前任务】\n{task}\n\n请立即开始你的规划与执行！",
+            bot=ctx.deps.bot,
+            ev=ctx.deps.ev,
             tools=tools,
+            return_mode="return",  # 结果返回给主Agent，由主Agent决定何时发送给用户
         )
 
         return f"【子Agent规划并执行完毕，交付结果如下】\n\n{result}"

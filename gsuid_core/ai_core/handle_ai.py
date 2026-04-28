@@ -44,7 +44,7 @@ MAX_CONCURRENT_AI_CALLS = 10  # 全局最大并发AI调用数
 _ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)  # AI并发信号量
 
 
-async def handle_ai_chat(bot: Bot, event: Event, mode: str = "chat"):
+async def handle_ai_chat(bot: Bot, event: Event):
     """
     处理AI聊天逻辑的独立函数，用于异步队列执行，是全部AI逻辑的入口函数
 
@@ -198,13 +198,10 @@ async def handle_ai_chat(bot: Bot, event: Event, mode: str = "chat"):
                 bot=bot,
                 ev=event,
                 rag_context=full_context,
-                must_return=True if mode == "test" else False,
+                return_mode="by_bot",  # 由 Agent 决定何时通过 bot 发送回复
             )
 
             # 步骤 8: 发送回复
-            if mode == "test":
-                return chat_result
-
             if chat_result:
                 await send_chat_result(bot, chat_result)
                 logger.info(f"🧠 [GsCore][AI] 回复已发送 (模式: {intent})")

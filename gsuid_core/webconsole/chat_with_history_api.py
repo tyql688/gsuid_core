@@ -235,7 +235,7 @@ async def chatWithHistory(req: Dict):
             bot=Bot(_bot, event),
             ev=event,
             rag_context=rag_context if rag_context else None,
-            must_return=True,
+            return_mode="return",
         )
         logger.info(result)
 

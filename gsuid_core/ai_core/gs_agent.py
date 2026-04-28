@@ -190,7 +190,7 @@ class GsCoreAIAgent:
         ev: Optional[Event] = None,
         rag_context: Optional[str] = None,
         tools: Optional[ToolList] = None,
-        must_return: bool = False,
+        return_mode: Literal["always", "return", "by_bot"] = "by_bot",
         output_type: None = None,
     ) -> str: ...
 
@@ -202,7 +202,7 @@ class GsCoreAIAgent:
         ev: Optional[Event] = None,
         rag_context: Optional[str] = None,
         tools: Optional[ToolList] = None,
-        must_return: bool = False,
+        return_mode: Literal["always", "return", "by_bot"] = "by_bot",
         output_type: type[_T] = ...,
     ) -> _T: ...
 
@@ -213,7 +213,7 @@ class GsCoreAIAgent:
         ev: Optional[Event] = None,
         rag_context: Optional[str] = None,
         tools: Optional[ToolList] = None,
-        must_return: bool = False,
+        return_mode: Literal["always", "return", "by_bot"] = "by_bot",
         output_type: Optional[type] = None,
     ) -> Union[str, Any]:
         """
@@ -300,7 +300,6 @@ class GsCoreAIAgent:
             logger.info("🧠 [GsCoreAIAgent] 开始执行 _agent.iter()...")
             logger.info(f"🧠 [GsCoreAIAgent] 当前 history: {len(self.history)}")
 
-            now_text = ""
             async with _agent.iter(
                 final_user_message,
                 deps=context,  # type: ignore[arg-type]
@@ -350,9 +349,8 @@ class GsCoreAIAgent:
                             elif isinstance(part, TextPart):
                                 _text = part.content.strip()
                                 logger.debug(f"🧠 [大模型文本]: {_text}")
-                                if bot and _text and not must_return:
+                                if bot and _text and return_mode in ["always", "by_bot"]:
                                     await send_chat_result(bot, _text)
-                                    now_text = _text
 
                             elif isinstance(part, ThinkingPart):
                                 _thinking = part.content.strip()
@@ -403,9 +401,9 @@ class GsCoreAIAgent:
                     return result.output
                 # 始终返回字符串类型
                 result_msg = str(result.output).strip()
-                if now_text.strip() == result_msg.strip() and not must_return:
+                if return_mode in ["by_bot"] and bot and ev:
                     return ""
-                return str(result.output).strip()
+                return result_msg
 
             # result 为空时的默认返回值
             return "Agent 执行完成，但未返回有效结果"
@@ -436,7 +434,6 @@ class GsCoreAIAgent:
                 )
 
                 # 获取强制总结的文本并发送
-                now_text = fallback_result.output
                 if bot:
                     await send_chat_result(bot, fallback_result.output)
                 return ""
@@ -482,7 +479,7 @@ class GsCoreAIAgent:
         ev: Optional[Event] = None,
         rag_context: Optional[str] = None,
         tools: Optional[ToolList] = None,
-        must_return: bool = False,
+        return_mode: Literal["always", "return", "by_bot"] = "by_bot",
         output_type: None = None,
     ) -> str: ...
 
@@ -494,7 +491,7 @@ class GsCoreAIAgent:
         ev: Optional[Event] = None,
         rag_context: Optional[str] = None,
         tools: Optional[ToolList] = None,
-        must_return: bool = False,
+        return_mode: Literal["always", "return", "by_bot"] = "by_bot",
         output_type: type[_T] = ...,
     ) -> _T: ...
 
@@ -505,7 +502,7 @@ class GsCoreAIAgent:
         ev: Optional[Event] = None,
         rag_context: Optional[str] = None,
         tools: Optional[ToolList] = None,
-        must_return: bool = False,
+        return_mode: Literal["always", "return", "by_bot"] = "by_bot",
         output_type: Optional[type] = None,
     ) -> Union[str, Any]:
         """
@@ -530,7 +527,7 @@ class GsCoreAIAgent:
                 ev=ev,
                 rag_context=rag_context,
                 tools=tools,
-                must_return=must_return,
+                return_mode=return_mode,
                 output_type=output_type,
             )
             logger.info("🧠 [GsCoreAIAgent] 执行完成，释放锁")
