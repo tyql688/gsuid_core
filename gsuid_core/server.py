@@ -366,7 +366,9 @@ class GsServer:
     async def connect(self, websocket: WebSocket, bot_id: str) -> _Bot:
         await websocket.accept()
         self.active_ws[bot_id] = websocket
-        self.active_bot[bot_id] = bot = _Bot(bot_id, websocket)
+        bot = _Bot(bot_id, websocket)
+        bot.start_send_worker()  # 启动独立的发送 worker，串行化 WebSocket 写入
+        self.active_bot[bot_id] = bot
         logger.info(f"{bot_id}已连接！")
         try:
             # fix: 正确处理同步和异步回调，并等待 gather

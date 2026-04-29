@@ -108,10 +108,52 @@ class _Bot:
         self.bg_tasks = set()
         self.sem = asyncio.Semaphore(10)
         self._shutdown_event: Optional[asyncio.Event] = None
+        # 独立发送队列：所有 WebSocket 发送操作通过此队列串行化执行
+        self._send_queue: asyncio.queues.Queue = asyncio.queues.Queue()
+        self._send_task: Optional[asyncio.Task] = None
 
     def set_shutdown_event(self, event: asyncio.Event):
         """设置 shutdown 事件，用于优雅关闭"""
         self._shutdown_event = event
+
+    async def _send_worker(self):
+        """独立的发送 worker，从发送队列中取出消息并串行发送。
+
+        保证同一 Bot 的消息按序发送，避免多个任务同时竞争 WebSocket 发送权限。
+        """
+        while True:
+            try:
+                # 从队列中取出发送任务（协程）
+                coro = await asyncio.wait_for(self._send_queue.get(), timeout=1.0)
+                try:
+                    await coro
+                except Exception as e:
+                    logger.exception(f"[_Bot] 发送任务异常: {e}")
+                finally:
+                    self._send_queue.task_done()
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception(f"[_Bot] 发送 worker 异常: {e}")
+
+    def start_send_worker(self):
+        """启动独立的发送 worker。
+
+        应该在 WebSocket 连接建立后调用。
+        """
+        if self._send_task is None or self._send_task.done():
+            self._send_task = asyncio.create_task(self._send_worker())
+            logger.debug(f"[_Bot] {self.bot_id} 发送 worker 已启动")
+
+    async def _enqueue_send(self, coro):
+        """将发送任务加入发送队列。
+
+        Args:
+            coro: 发送协程
+        """
+        await self._send_queue.put(coro)
 
     async def target_send(
         self,
@@ -315,7 +357,13 @@ class _Bot:
             logger.info(f"[发送消息to] {bot_id} - {target_type} - {target_id}")
             if self.bot:
                 body = msgjson.encode(send)
-                await self.bot.send_bytes(body)
+                # 通过发送队列串行化 WebSocket 发送，避免多任务并发写入
+                ws = self.bot  # 捕获非 None 引用，避免闭包中 self.bot 可能为 None 的类型问题
+
+                async def _do_send(ws: WebSocket = ws, body: bytes = body):
+                    await ws.send_bytes(body)
+
+                await self._enqueue_send(_do_send())
             else:
                 self.send_dict[task_id] = send
                 if task_event:

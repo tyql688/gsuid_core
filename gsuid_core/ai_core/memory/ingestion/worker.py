@@ -2,10 +2,15 @@
 
 单实例后台任务，从 observation_queue 消费消息，批量处理并写入数据库。
 按 scope_key 分组，维护缓冲区，满足时间窗口或数量阈值时触发 flush。
+
+关键设计：IngestionWorker 在独立线程的事件循环中运行，避免 LLM 调用
+（Entity/Edge 提取）阻塞主事件循环导致 WebSocket 心跳超时。
 """
 
 import time
+import queue as sync_queue
 import asyncio
+import threading
 from collections import defaultdict
 
 from gsuid_core.logger import logger
@@ -21,9 +26,10 @@ from ...utils import extract_json_from_text
 
 
 class IngestionWorker:
-    """单实例，在应用启动时以后台任务运行。
+    """单实例，在独立线程的事件循环中运行。
 
-    从 observation_queue 消费消息，批量处理并写入数据库。
+    从 observation_queue（线程安全的 queue.Queue）消费消息，批量处理并写入数据库。
+    独立线程运行确保 LLM 调用不会阻塞主事件循环。
     """
 
     def __init__(self):
@@ -35,20 +41,56 @@ class IngestionWorker:
         self._last_flush: dict[str, float] = {}
         # {scope_key: True} 标记某个 scope_key 正在 flush 中，避免重复创建 flush 任务
         self._flushing: set[str] = set()
-        self._llm_semaphore = asyncio.Semaphore(memory_config.llm_semaphore_limit)
+        self._llm_semaphore: asyncio.Semaphore | None = None  # 在独立事件循环中创建
         self._running = False
         # 保护 flush_all() 执行期间禁止新的 _flush 并发执行
-        # 注意：此锁不阻止 observe 入队（Queue 本身线程安全），
-        # 而是防止 flush_all 与 _consume_loop 的 _flush 产生竞态
-        self._flush_lock = asyncio.Lock()
-        # OPT-03: 修复暂停逻辑竞态。使用"允许消费"事件而非"暂停"事件
-        # _can_consume.set() = 可以消费，_can_consume.clear() = 暂停消费
-        # 这样 wait() 在 clear 时会真正阻塞，clear 后 set() 才会放行
-        self._can_consume = asyncio.Event()
-        self._can_consume.set()  # 默认允许消费
+        self._flush_lock: asyncio.Lock | None = None  # 在独立事件循环中创建
+        # 独立线程事件循环
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        # flush_all 同步等待事件
+        self._flush_all_event: threading.Event | None = None
+
+    def start_in_thread(self):
+        """在独立线程中启动事件循环，避免阻塞主循环。
+
+        此方法在主事件循环中调用，启动后立即返回。
+        """
+        ready_event = threading.Event()
+
+        def _run_loop():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            # 在独立事件循环中创建 asyncio 原语
+            self._llm_semaphore = asyncio.Semaphore(memory_config.llm_semaphore_limit)
+            self._flush_lock = asyncio.Lock()
+            self._running = True
+            ready_event.set()  # 通知主线程：事件循环已就绪
+            try:
+                self._loop.run_until_complete(self._run_forever())
+            except Exception as e:
+                logger.error(f"🧠 [Memory] IngestionWorker 线程异常退出: {e}", exc_info=True)
+            finally:
+                self._loop.close()
+
+        self._thread = threading.Thread(target=_run_loop, daemon=True, name="MemoryIngestionWorker")
+        self._thread.start()
+        ready_event.wait(timeout=10)  # 等待事件循环就绪
+        if not self._loop:
+            raise RuntimeError("IngestionWorker 线程启动超时")
+        logger.info("🧠 [Memory] IngestionWorker 独立线程已启动")
+
+    async def _run_forever(self):
+        """独立事件循环中的主循环"""
+        await asyncio.gather(
+            self._consume_loop(),
+            self._flush_timer_loop(),
+        )
 
     async def start(self):
-        """启动后台消费循环"""
+        """兼容旧接口：在当前事件循环中启动（不推荐，会阻塞主循环）"""
+        self._llm_semaphore = asyncio.Semaphore(memory_config.llm_semaphore_limit)
+        self._flush_lock = asyncio.Lock()
         self._running = True
         await asyncio.gather(
             self._consume_loop(),
@@ -59,25 +101,38 @@ class IngestionWorker:
         """立即将所有缓冲区 flush 到数据库。
 
         用于 /api/chat_with_history 等需要同步等待记忆构建完成的场景。
-
-        BUG-03 修复：
-        1. 使用 asyncio.Event 通知 _consume_loop 暂停入队，而非仅用 Lock 保护 flush_all 自身。
-           _consume_loop 在 _flush_lock 持有期间产生的新数据会写入 buffer，
-           这些数据会在 flush 循环末尾的第二次队列消费中被处理。
-        2. 在 flush 循环末尾再执行一次队列消费 + flush，确保 flush 期间入队的数据也被写入。
+        此方法通过 asyncio.run_coroutine_threadsafe() 跨线程提交到独立事件循环执行，
+        使用 asyncio.wrap_future 异步等待，不阻塞主事件循环。
         """
+        if self._loop is None or not self._running:
+            logger.warning("🧠 [Memory] IngestionWorker 未启动，跳过 flush_all")
+            return
+
         logger.info("🧠 [Memory] 开始强行同步记忆数据到数据库...")
 
-        # OPT-03: 通知 _consume_loop 暂停入队（通过清除事件）
-        self._can_consume.clear()
+        # 跨线程提交到独立事件循环
+        future = asyncio.run_coroutine_threadsafe(
+            self._flush_all_inner(),
+            self._loop,
+        )
+        # 异步等待最多 120 秒，不阻塞主事件循环
+        try:
+            await asyncio.wait_for(asyncio.wrap_future(future), timeout=120)
+        except asyncio.TimeoutError:
+            logger.error("🧠 [Memory] flush_all 超时（120秒），放弃等待")
+        except Exception as e:
+            logger.error(f"🧠 [Memory] flush_all 异常: {e}", exc_info=True)
 
+    async def _flush_all_inner(self):
+        """在独立事件循环中执行的 flush_all 核心逻辑"""
+        assert self._flush_lock is not None, "IngestionWorker 未初始化"
         async with self._flush_lock:
-            # 第一次：消费所有队列中的数据到 buffers
+            # 消费所有队列中的数据到 buffers
             while not self._queue.empty():
                 try:
                     record = self._queue.get_nowait()
                     self._buffers[record.scope_key].append(record)
-                except asyncio.QueueEmpty:
+                except sync_queue.Empty:
                     break
 
             # flush buffers
@@ -90,16 +145,14 @@ class IngestionWorker:
                 if self._buffers.get(scope_key):
                     await self._flush(scope_key)
 
-            # BUG-03 修复：flush 循环结束后，再次消费队列 + flush，
-            # 确保 flush_all 持有锁期间 _consume_loop 入队的数据也被写入
+            # 再次消费队列 + flush，确保期间入队的数据也被写入
             while not self._queue.empty():
                 try:
                     record = self._queue.get_nowait()
                     self._buffers[record.scope_key].append(record)
-                except asyncio.QueueEmpty:
+                except sync_queue.Empty:
                     break
 
-            # 第二次 flush，确保前述消费的数据也被写入
             scope_keys = list(self._buffers.keys())
             for scope_key in scope_keys:
                 while scope_key in self._flushing:
@@ -112,24 +165,28 @@ class IngestionWorker:
             else:
                 logger.info("🧠 [Memory] flush_all 完成，分层图将在后台异步重建")
 
-        # OPT-03: 恢复 _consume_loop 入队
-        self._can_consume.set()
-
     async def stop(self):
         """停止后台消费循环"""
         self._running = False
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
 
     async def _consume_loop(self):
         """从队列取消息，放入对应 scope_key 的缓冲区。
 
-        OPT-03 修复：使用 _can_consume.wait() 真正阻塞，clear 时 wait() 阻塞，set 时放行。
+        使用线程安全的 queue.Queue，通过 asyncio.to_thread 避免阻塞事件循环。
+        直接使用 queue.get(timeout=1.0) 的内置超时，不额外包裹 wait_for，
+        避免超时取消后线程悬挂导致的线程泄漏。
         """
         while self._running:
             try:
-                # OPT-03: 等待 _can_consume 被 clear 时会真正阻塞，不会立即返回
-                await self._can_consume.wait()
-
-                record: ObservationRecord = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                # queue.get 带 timeout，超时抛出 sync_queue.Empty
+                # 不用 wait_for 包裹，避免 to_thread 线程在 wait_for 取消后仍阻塞
+                record: ObservationRecord = await asyncio.to_thread(
+                    self._queue.get,
+                    True,
+                    1.0,  # block=True, timeout=1.0
+                )
                 self._buffers[record.scope_key].append(record)
 
                 # 超过单次上限且该 scope_key 没有正在 flush 时才触发
@@ -138,7 +195,7 @@ class IngestionWorker:
                     and record.scope_key not in self._flushing
                 ):
                     asyncio.create_task(self._flush(record.scope_key))
-            except asyncio.TimeoutError:
+            except sync_queue.Empty:
                 continue
             except asyncio.CancelledError:
                 raise
@@ -169,14 +226,23 @@ class IngestionWorker:
             return
         self._last_flush[scope_key] = time.time()
 
+        assert self._llm_semaphore is not None, "IngestionWorker 未初始化"
         async with self._llm_semaphore:
             try:
                 batch_size = memory_config.batch_max_size
                 batches = [records[i : i + batch_size] for i in range(0, len(records), batch_size)]
                 logger.info(f"🧠 [Memory] scope={scope_key} 共 {len(records)} 条，分 {len(batches)} 批处理")
                 for batch in batches:
-                    await _ingest_batch(batch, scope_key)
-                    _record_ingestion_stats(len(batch), success=True)
+                    # P0: 对每批摄入添加超时保护，防止 LLM 调用无限阻塞
+                    try:
+                        await asyncio.wait_for(
+                            _ingest_batch(batch, scope_key),
+                            timeout=120,  # 单批最多 120 秒
+                        )
+                        _record_ingestion_stats(len(batch), success=True)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"🧠 [Memory] scope={scope_key} 批次摄入超时（120秒），跳过")
+                        _record_ingestion_stats(len(batch), success=False)
             except Exception as e:
                 logger.error(f"Ingestion failed for {scope_key}: {e}", exc_info=True)
                 # Bug-01 修复：异常时将数据还原到缓冲区，等待下次重试

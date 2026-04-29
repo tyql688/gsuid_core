@@ -456,10 +456,12 @@ def on_core_shutdown(func: Callable):
 
 ### 7.2 已注册的启动钩子
 
-| 钩子函数 | 模块 | 功能 |
-|----------|------|------|
-| `init_default_personas` | `ai_core/persona/startup.py` | 初始化默认角色（早柚） |
-| `init_all` | `ai_core/rag/startup.py` | 初始化RAG模块 |
+| 钩子函数 | 模块 | 优先级 | 功能 |
+|----------|------|--------|------|
+| `init_all` | `ai_core/rag/startup.py` | 0 | 初始化RAG模块（Embedding模型 + Qdrant客户端） |
+| `init_default_personas` | `ai_core/persona/startup.py` | 0 | 初始化默认角色（早柚） |
+| `init_memory_system` | `ai_core/memory/startup.py` | 5 | 初始化记忆系统（Qdrant Collection + IngestionWorker独立线程） |
+| `init_ai_core_statistics` | `ai_core/statistics/startup.py` | 10 | 初始化AI统计系统（HistoryManager清理 + Heartbeat巡检） |
 
 ### 7.3 RAG模块初始化详解
 
@@ -540,11 +542,17 @@ async def websocket_endpoint(websocket: WebSocket, bot_id: str):
             await websocket.close(code=1008)
             return
 
-    # 3. 建立连接
+    # 3. 建立连接（含发送 worker 启动）
     bot = await gss.connect(websocket, bot_id)
 
     # 4. 启动读写并发
+    #    start(): 接收消息 → handle_event → 任务入队
+    #    process(): 从队列取出任务 → _safe_run → handle_ai_chat 等
     await asyncio.gather(process(), start())
+```
+
+> **注意**：`gss.connect()` 内部会调用 `bot.start_send_worker()` 启动独立的发送 worker，
+> 确保所有 WebSocket 写入通过发送队列串行化执行，避免多任务并发写入导致连接不稳定。
 ```
 
 ### 8.3 HTTP 端点 (可选)
@@ -575,18 +583,62 @@ class GsServer:
 
     async def connect(self, websocket: WebSocket, bot_id: str) -> _Bot:
         """建立Bot连接"""
+        await websocket.accept()
         self.active_ws[bot_id] = websocket
         bot = _Bot(bot_id, websocket)
+        bot.start_send_worker()  # 启动独立的发送 worker，串行化 WebSocket 写入
         self.active_bot[bot_id] = bot
         return bot
 
     async def disconnect(self, bot_id: str):
         """断开Bot连接"""
         if bot_id in self.active_ws:
+            try:
+                await self.active_ws[bot_id].close(code=1001)
+            except Exception:
+                pass
             del self.active_ws[bot_id]
         if bot_id in self.active_bot:
             del self.active_bot[bot_id]
 ```
+
+**`_Bot` 发送队列架构**：
+
+```python
+# gsuid_core/bot.py::_Bot
+
+class _Bot:
+    def __init__(self, _id: str, ws: Optional[WebSocket] = None):
+        self.bot_id = _id
+        self.bot = ws
+        self.queue = asyncio.queues.PriorityQueue()      # 任务队列
+        self._send_queue: asyncio.queues.Queue = ...     # 独立发送队列
+        self._send_task: Optional[asyncio.Task] = None   # 发送 worker 任务
+
+    async def _send_worker(self):
+        """独立的发送 worker，从发送队列中取出消息并串行发送"""
+        while True:
+            coro = await asyncio.wait_for(self._send_queue.get(), timeout=1.0)
+            await coro
+            self._send_queue.task_done()
+
+    def start_send_worker(self):
+        """启动独立的发送 worker（在 WebSocket 连接时调用）"""
+        self._send_task = asyncio.create_task(self._send_worker())
+
+    async def target_send(self, ...):
+        """发送消息（通过发送队列串行化）"""
+        # ... 消息处理逻辑 ...
+        if self.bot:
+            body = msgjson.encode(send)
+            ws = self.bot
+            async def _do_send(ws=ws, body=body):
+                await ws.send_bytes(body)
+            await self._enqueue_send(_do_send())
+```
+
+> **设计目的**：所有 WebSocket 写入操作通过 `_send_queue` 串行化执行，
+> 避免 AI 回复、Heartbeat 主动发言、定时任务等多个任务同时写入 WebSocket 导致帧乱序或连接不稳定。
 
 ---
 
@@ -600,10 +652,12 @@ class GsServer:
 | 4 | 模块导入 | `server.py::cached_import()` |
 | 5 | 配置合并 | `config.py::CoreConfig.update_config()` |
 | 6 | **Core Start钩子** | `server.py::core_start_def` |
-| 7 | **RAG初始化** | `ai_core/rag/startup.py::init_all()` |
-| 8 | **Persona初始化** | `ai_core/persona/startup.py::init_default_personas()` |
-| 9 | WebSocket服务 | `core.py::websocket_endpoint()` |
-| 10 | HTTP服务 (可选) | `core.py::sendMsg()` |
+| 7 | **RAG初始化** (priority=0) | `ai_core/rag/startup.py::init_all()` |
+| 8 | **Persona初始化** (priority=0) | `ai_core/persona/startup.py::init_default_personas()` |
+| 9 | **Memory系统初始化** (priority=5) | `ai_core/memory/startup.py::init_memory_system()` — 启动 IngestionWorker 独立线程 |
+| 10 | **AI统计初始化** (priority=10) | `ai_core/statistics/startup.py::init_ai_core_statistics()` — HistoryManager清理 + Heartbeat巡检 |
+| 11 | WebSocket服务 | `core.py::websocket_endpoint()` |
+| 12 | HTTP服务 (可选) | `core.py::sendMsg()` |
 
 ---
 

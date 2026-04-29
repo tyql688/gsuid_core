@@ -4,18 +4,19 @@ Observer 是整个记忆系统的"被动感知层"：AI 可以读取所有消息
 但不需要因此回复任何一条。它与 AI 的发言决策完全正交——即使 Persona 配置为
 纯静默模式，记忆依然在后台积累。
 
-单进程内通过 asyncio.Queue 传递观察记录，避免任何进程间通信的复杂性。
+使用 queue.Queue（线程安全）传递观察记录，支持 IngestionWorker 在独立线程
+的事件循环中运行，避免 LLM 调用阻塞主事件循环导致 WebSocket 心跳超时。
 """
 
-import asyncio
+import queue as sync_queue
 from typing import Optional
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
 from gsuid_core.logger import logger
 
-# 全局消息队列（单进程内跨模块共享）
-_observation_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
+# 全局消息队列（线程安全，支持跨线程通信）
+_observation_queue: sync_queue.Queue = sync_queue.Queue(maxsize=10_000)
 
 
 @dataclass
@@ -103,7 +104,7 @@ async def observe(
             statistics_manager.record_memory_observation()
         except Exception:
             pass
-    except asyncio.QueueFull:
+    except sync_queue.Full:
         # 队列满时丢弃最老的一条，保证新消息不丢失
         try:
             _observation_queue.get_nowait()
@@ -112,6 +113,6 @@ async def observe(
             logger.warning("Memory observation queue overflow, dropping message")
 
 
-def get_observation_queue() -> asyncio.Queue:
-    """供 IngestionWorker 获取队列引用"""
+def get_observation_queue() -> sync_queue.Queue:
+    """供 IngestionWorker 获取队列引用（线程安全的 queue.Queue）"""
     return _observation_queue

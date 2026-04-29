@@ -4,10 +4,13 @@
 前置条件：rag/base.py 的 init_embedding_model() 必须已执行。
 """
 
-import asyncio
+from typing import Optional
 
 from gsuid_core.logger import logger
 from gsuid_core.server import on_core_start
+
+# 模块级引用，供 /api/chat_with_history 调用 flush_all()
+_ingestion_worker: Optional[object] = None
 
 
 @on_core_start(priority=5)
@@ -42,14 +45,14 @@ async def init_memory_system():
         logger.error(f"🧠 [Memory] Qdrant Collection 初始化失败: {e}")
         return
 
-    # 3. 启动 IngestionWorker 后台任务
+    # 3. 启动 IngestionWorker 后台任务（在独立线程中运行，避免 LLM 调用阻塞主事件循环）
     global _ingestion_worker
     try:
         from .ingestion.worker import IngestionWorker
 
         _ingestion_worker = IngestionWorker()
-        asyncio.create_task(_ingestion_worker.start())
-        logger.info("🧠 [Memory] IngestionWorker 后台任务已启动")
+        _ingestion_worker.start_in_thread()
+        logger.info("🧠 [Memory] IngestionWorker 后台任务已启动（独立线程）")
     except Exception as e:
         logger.error(f"🧠 [Memory] IngestionWorker 启动失败: {e}")
         return
@@ -57,10 +60,8 @@ async def init_memory_system():
     logger.info("🧠 [Memory] 记忆系统初始化完成")
 
 
-# 模块级引用，供 /api/chat_with_history 调用 flush_all()
-_ingestion_worker = None
-
-
 def get_ingestion_worker():
     """获取 IngestionWorker 实例（需在记忆系统初始化后调用才有效）"""
+    if _ingestion_worker is None:
+        logger.warning("🧠 [Memory] IngestionWorker 尚未初始化，请确认记忆系统已启动")
     return _ingestion_worker

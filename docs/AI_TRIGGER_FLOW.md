@@ -2189,7 +2189,8 @@ Memory 模块是基于 Mnemis 双路检索思想的多群组/多用户 Agent 记
 - **Observer 与发言决策正交**：AI 可以读取所有消息以构建认知，但不需要因此回复任何一条。即使 Persona 配置为纯静默模式，记忆依然在后台积累。
 - **双路检索（Dual-Route Retrieval）**：System-1（向量相似度快速匹配）+ System-2（分层图遍历全局选择），合并后经 Reranker 重排序。
 - **Scope Key 隔离**：群组间严格隔离，同时支持用户跨群全局画像。
-- **单进程 asyncio.Queue**：避免进程间通信的复杂性。
+- **线程隔离**：IngestionWorker 在独立线程的事件循环中运行，LLM 调用不阻塞主事件循环，避免 WebSocket 心跳超时断连。
+- **线程安全队列**：使用 `queue.Queue`（线程安全）替代 `asyncio.Queue`，支持跨线程通信。
 
 **核心数据流**：
 
@@ -2210,14 +2211,14 @@ gsuid_core/ai_core/memory/
 ├── __init__.py           # 模块导出（observe, dual_route_retrieve, MemoryContext 等）
 ├── config.py             # MemoryConfig 全局配置（dataclass 单例）
 ├── scope.py              # ScopeType 枚举 + make_scope_key() 函数
-├── observer.py           # 观察者管道（asyncio.Queue + 过滤逻辑）
+├── observer.py           # 观察者管道（queue.Queue 线程安全 + 过滤逻辑）
 ├── startup.py            # @on_core_start 初始化入口
 ├── database/             # 图结构存储（SQLAlchemy，独立 MemBase）
 │   ├── __init__.py       # _MemorySessionFactory + get_async_session
 │   └── models.py         # 6 个模型 + 2 个关联表
 ├── ingestion/            # 摄入引擎（后台消费 + LLM 提取）
 │   ├── __init__.py
-│   ├── worker.py         # IngestionWorker（单实例后台任务）+ _ingest_batch()
+│   ├── worker.py         # IngestionWorker（独立线程事件循环）+ _ingest_batch()
 │   ├── entity.py         # extract_and_upsert_entities() 两阶段去重
 │   ├── edge.py           # extract_and_upsert_edges() 冲突检测
 │   └── hiergraph.py      # HierarchicalGraphBuilder + AIMemHierarchicalGraphMeta + 分层图构建
@@ -2253,13 +2254,15 @@ gsuid_core/ai_core/memory/
 │         │                   │                       │              │
 │         ▼                   ▼                       │              │
 │  ┌──────────────────────────────────┐               │              │
-│  │     asyncio.Queue (maxsize=10000) │               │              │
+│  │     queue.Queue (maxsize=10000)   │               │              │
 │  │     _observation_queue            │               │              │
+│  │     (线程安全，跨线程通信)          │               │              │
 │  └──────────────┬───────────────────┘               │              │
 │                 │                                    │              │
-│                 ▼                                    │              │
+│                 ▼  (跨线程传递)                       │              │
 │  ┌──────────────────────────────────┐               │              │
-│  │     IngestionWorker (单实例)       │               │              │
+│  │  IngestionWorker (独立线程事件循环) │               │              │
+│  │  线程名: MemoryIngestionWorker    │               │              │
 │  │  ┌────────────────────────────┐  │               │              │
 │  │  │ _consume_loop()            │  │               │              │
 │  │  │ _flush_timer_loop()        │  │               │              │
@@ -2338,7 +2341,10 @@ make_scope_key(ScopeType.USER_GLOBAL, "12345")
 
 **文件位置**: [`gsuid_core/ai_core/memory/observer.py`](gsuid_core/ai_core/memory/observer.py)
 
-Observer 是记忆系统的"被动感知层"，通过 `asyncio.Queue` 在单进程内传递观察记录。
+Observer 是记忆系统的"被动感知层"，通过 `queue.Queue`（线程安全）在主线程和 IngestionWorker 线程之间传递观察记录。
+
+> **设计变更**：原使用 `asyncio.Queue`（非线程安全），改为 `queue.Queue` 以支持
+> IngestionWorker 在独立线程的事件循环中运行，避免 LLM 调用阻塞主事件循环。
 
 **ObservationRecord 数据结构**：
 
@@ -2861,10 +2867,28 @@ async def init_memory_system():
     # 1. 确保 Qdrant Collection 存在
     await ensure_memory_collections()
 
-    # 2. 启动 IngestionWorker（无参构造，内部使用 async_maker）
+    # 2. 启动 IngestionWorker（在独立线程中运行，避免 LLM 调用阻塞主事件循环）
     worker = IngestionWorker()
-    asyncio.create_task(worker.start())
+    worker.start_in_thread()  # 启动独立线程事件循环，而非 asyncio.create_task()
 ```
+
+> **设计变更**：IngestionWorker 从 `asyncio.create_task(worker.start())` 改为
+> `worker.start_in_thread()`，在独立线程的事件循环中运行。
+> 这确保了 Memory 系统的 LLM 调用（Entity/Edge 提取）不会阻塞主事件循环，
+> 避免 NoneBot2 WebSocket 心跳超时断连。
+>
+> **线程架构**：
+> ```
+> 主事件循环 (Main Event Loop)
+> ├── WebSocket 消息接收
+> ├── AI 对话处理
+> └── 其他定时任务
+>
+> 独立线程事件循环 (MemoryIngestionWorker)
+> ├── _consume_loop() - 从 queue.Queue 消费消息
+> ├── _flush() - 批量 LLM 提取 + 数据库写入
+> └── _flush_timer_loop() - 定时检查缓冲区
+> ```
 
 ### 10.13 记忆统计
 
