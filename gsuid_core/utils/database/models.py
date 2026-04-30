@@ -88,8 +88,25 @@ class Subscribe(BaseModel, table=True):
                 bot = Bot(BOT, ev)
                 await bot.send_option(**params)
             else:
-                logger.error(f"[订阅] 机器人{self.WS_BOT_ID}不存在, 该消息无法发送!")
-                return -1
+                # WS_BOT_ID 失效（可能重连后 ID 变了），尝试通过 bot_id 查找活跃 Bot
+                found = False
+                for ws_bot_id, _bot in gss.active_bot.items():
+                    if _bot.bot_id == self.bot_id:
+                        logger.info(f"[订阅] WS_BOT_ID {self.WS_BOT_ID} 已失效，自动切换到 {ws_bot_id}")
+                        # 更新数据库中的 WS_BOT_ID
+                        self.WS_BOT_ID = ws_bot_id
+                        await self.update_data(
+                            user_id=self.user_id,
+                            bot_id=self.bot_id,
+                            WS_BOT_ID=ws_bot_id,
+                        )
+                        bot = Bot(_bot, ev)
+                        await bot.send_option(**params)
+                        found = True
+                        break
+                if not found:
+                    logger.error(f"[订阅] 机器人{self.WS_BOT_ID}不存在, 该消息无法发送!")
+                    return -1
         else:
             for bot_id in gss.active_bot:
                 BOT = gss.active_bot[bot_id]

@@ -1,4 +1,6 @@
+import os
 import sys
+import signal
 import asyncio
 import argparse
 from typing import Dict
@@ -11,6 +13,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from msgspec import json as msgjson, to_builtins
 
 from gsuid_core.version import __version__
+from gsuid_core.shutdown import shutdown_event
 
 sys.path.append(str(Path(__file__).resolve().parent))
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -61,7 +64,17 @@ async def main():
     import time
 
     start_time = time.time()
+
+    from gsuid_core.logger import logger
+    from gsuid_core.ai_core.configs.ai_config import ai_config
     from gsuid_core.utils.database.base_models import init_database
+
+    hf_endpoint: str = ai_config.get_config("hf_endpoint").data
+
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "60"
+    os.environ["HF_ENDPOINT"] = hf_endpoint
+
+    logger.info(f"🧠 [GsCore] 切换HF地址，地址: {hf_endpoint}")
 
     await init_database()
 
@@ -69,12 +82,11 @@ async def main():
 
     await load_gss(args.dev)
 
+    import gsuid_core.ai_core.buildin_tools  # noqa: F401
     from gsuid_core.bot import _Bot
     from gsuid_core.config import core_config
-    from gsuid_core.logger import logger
     from gsuid_core.models import MessageReceive
     from gsuid_core.handler import handle_event
-    from gsuid_core.ai_core.register import get_registered_tools
     from gsuid_core.security_manager import sec_manager
     from gsuid_core.utils.database.startup import (  # noqa: F401
         trans_adapter as ta,
@@ -129,15 +141,27 @@ async def main():
 
             async def start():
                 try:
-                    while True:
-                        data = await websocket.receive_bytes()
-                        msg = msgjson.decode(data, type=MessageReceive)
-                        await handle_event(bot, msg)
-                except WebSocketDisconnect:
+                    while not shutdown_event.is_set():
+                        try:
+                            # 使用 wait_for 添加超时，以便定期检查 shutdown_event
+                            data = await asyncio.wait_for(websocket.receive_bytes(), timeout=1.0)
+                            msg = msgjson.decode(data, type=MessageReceive)
+                            await handle_event(bot, msg)
+                        except asyncio.TimeoutError:
+                            continue
+                        except WebSocketDisconnect:
+                            break
+                except CancelledError:
+                    pass
+                finally:
                     await gss.disconnect(bot_id)
 
             async def process():
-                await bot._process()
+                """process 函数的职责是启动 bot._process，由 _process 内部处理 shutdown"""
+                try:
+                    await bot._process(shutdown_event)
+                except CancelledError:
+                    pass
 
             logger.info("[GsCore] 启动WS服务中...")
             await asyncio.gather(process(), start())
@@ -166,13 +190,27 @@ async def main():
         log_config=None,
         loop="asyncio",
     )
+
+    # 设置信号处理，在收到 SIGINT/SIGTERM 时设置 shutdown_event
+    # 注意：uvicorn 也会处理这些信号，这里主要是为了通知所有任务
+    loop = asyncio.get_event_loop()
+
+    def set_shutdown_event():
+        logger.info("[GsCore] 收到关闭信号，正在设置 shutdown_event...")
+        shutdown_event.set()
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, set_shutdown_event)
+    except NotImplementedError:
+        # Windows 不支持 add_signal_handler，仅依赖 uvicorn 的信号处理
+        logger.debug("[GsCore] 当前平台不支持 add_signal_handler，将依赖 uvicorn 的关闭流程")
+
     server = uvicorn.Server(config)
     end_time = time.time()
     logger.success(ASCII_FONT)
     duration = round(end_time - start_time, 2)
     logger.success(f"🚀 [GsCore] 启动完成, 耗时: {duration:.2f}s, 版本: {__version__}")
-
-    get_registered_tools()
 
     await server.serve()
 

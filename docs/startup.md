@@ -134,7 +134,11 @@ async def load_plugins(self, dev_mode: bool = False):
         except Exception as e:
             logger.exception(f"❌ 插件{filepath.stem}导入失败")
 
-    # 6. 写入配置
+    # 6. 调用 core_start 钩子 (AI初始化等)
+    for func in core_start_def:
+        await func()
+
+    # 7. 写入配置
     core_config.lazy_write_config()
 ```
 
@@ -151,6 +155,8 @@ gsuid_core/
 │   │   └── __init__.py         # 单插件包
 │   ├── plugin_b/
 │   │   └── __full__.py         # 全量加载模式
+│   │       ├── module_a.py
+│   │       └── module_b.py
 │   └── single_plugin.py        # 单文件插件
 │
 └── buildin_plugins/            # 内置插件目录
@@ -224,6 +230,7 @@ normalize_name() 规范化名称
 (统一小写，-_. 互换)
     │
     ├─── 在 ignore_dep 列表中? ──► 跳过
+    │       (fastapi/pydantic/gsuid-core/toml/packaging等基础包)
     │
     ├─── 未安装? ──► 加入安装队列
     │
@@ -249,6 +256,19 @@ mirrors = [
     ("清华源 (Tsinghua)", "https://pypi.tuna.tsinghua.edu.cn/simple"),
     ("官方源 (PyPI)", "https://pypi.org/simple"),
 ]
+```
+
+### 4.4 忽略的基础依赖
+
+```python
+ignore_dep = {
+    "python",
+    "fastapi",
+    "pydantic",
+    "gsuid-core",
+    "toml",
+    "packaging",
+}
 ```
 
 ---
@@ -411,9 +431,76 @@ class SV:
 
 ---
 
-## 七、Web 服务启动
+## 七、Core Start 钩子系统
 
-### 7.1 uvicorn 配置
+### 7.1 钩子定义
+
+```python
+# gsuid_core/server.py
+
+core_start_def: Set[Callable] = set()
+core_shutdown_def: Set[Callable] = set()
+
+def on_core_start(func: Callable):
+    """Core启动时执行的钩子"""
+    if func not in core_start_def:
+        core_start_def.add(func)
+    return func
+
+def on_core_shutdown(func: Callable):
+    """Core关闭时执行的钩子"""
+    if func not in core_shutdown_def:
+        core_shutdown_def.add(func)
+    return func
+```
+
+### 7.2 已注册的启动钩子
+
+| 钩子函数 | 模块 | 优先级 | 功能 |
+|----------|------|--------|------|
+| `init_all` | `ai_core/rag/startup.py` | 0 | 初始化RAG模块（Embedding模型 + Qdrant客户端） |
+| `init_default_personas` | `ai_core/persona/startup.py` | 0 | 初始化默认角色（早柚） |
+| `init_memory_system` | `ai_core/memory/startup.py` | 5 | 初始化记忆系统（Qdrant Collection + IngestionWorker独立线程） |
+| `init_ai_core_statistics` | `ai_core/statistics/startup.py` | 10 | 初始化AI统计系统（HistoryManager清理 + Heartbeat巡检） |
+
+### 7.3 RAG模块初始化详解
+
+```python
+# gsuid_core/ai_core/rag/startup.py::init_all()
+
+@on_core_start
+async def init_all():
+    """初始化RAG模块的所有组件"""
+    # 1. 初始化Embedding模型和Qdrant客户端
+    init_embedding_model()
+
+    # 2. 初始化工具和知识集合
+    from . import init_tools_collection, init_knowledge_collection
+    await init_tools_collection()
+    await init_knowledge_collection()
+
+    # 3. 同步工具和知识到向量库
+    from gsuid_core.ai_core.register import _TOOL_REGISTRY
+    from . import sync_tools, sync_knowledge
+    await sync_tools(_TOOL_REGISTRY)
+    await sync_knowledge()
+```
+
+### 7.4 Persona模块初始化详解
+
+```python
+# gsuid_core/ai_core/persona/startup.py
+
+@on_core_start
+async def init_default_personas():
+    await save_persona("早柚", sayu_persona_prompt)
+```
+
+---
+
+## 八、Web 服务启动
+
+### 8.1 uvicorn 配置
 
 ```python
 # gsuid_core/core.py
@@ -431,7 +518,7 @@ server = uvicorn.Server(config)
 await server.serve()
 ```
 
-### 7.2 WebSocket 端点
+### 8.2 WebSocket 端点
 
 ```python
 # gsuid_core/core.py::websocket_endpoint()
@@ -455,14 +542,20 @@ async def websocket_endpoint(websocket: WebSocket, bot_id: str):
             await websocket.close(code=1008)
             return
 
-    # 3. 建立连接
+    # 3. 建立连接（含发送 worker 启动）
     bot = await gss.connect(websocket, bot_id)
 
     # 4. 启动读写并发
+    #    start(): 接收消息 → handle_event → 任务入队
+    #    process(): 从队列取出任务 → _safe_run → handle_ai_chat 等
     await asyncio.gather(process(), start())
 ```
 
-### 7.3 HTTP 端点 (可选)
+> **注意**：`gss.connect()` 内部会调用 `bot.start_send_worker()` 启动独立的发送 worker，
+> 确保所有 WebSocket 写入通过发送队列串行化执行，避免多任务并发写入导致连接不稳定。
+```
+
+### 8.3 HTTP 端点 (可选)
 
 ```python
 if ENABLE_HTTP:
@@ -478,9 +571,78 @@ if ENABLE_HTTP:
             return {"status_code": -100, "data": None}
 ```
 
+### 8.4 Bot连接管理
+
+```python
+# gsuid_core/server.py::GsServer
+
+class GsServer:
+    def __init__(self):
+        self.active_ws: Dict[str, WebSocket] = {}    # WebSocket连接
+        self.active_bot: Dict[str, _Bot] = {}        # Bot实例
+
+    async def connect(self, websocket: WebSocket, bot_id: str) -> _Bot:
+        """建立Bot连接"""
+        await websocket.accept()
+        self.active_ws[bot_id] = websocket
+        bot = _Bot(bot_id, websocket)
+        bot.start_send_worker()  # 启动独立的发送 worker，串行化 WebSocket 写入
+        self.active_bot[bot_id] = bot
+        return bot
+
+    async def disconnect(self, bot_id: str):
+        """断开Bot连接"""
+        if bot_id in self.active_ws:
+            try:
+                await self.active_ws[bot_id].close(code=1001)
+            except Exception:
+                pass
+            del self.active_ws[bot_id]
+        if bot_id in self.active_bot:
+            del self.active_bot[bot_id]
+```
+
+**`_Bot` 发送队列架构**：
+
+```python
+# gsuid_core/bot.py::_Bot
+
+class _Bot:
+    def __init__(self, _id: str, ws: Optional[WebSocket] = None):
+        self.bot_id = _id
+        self.bot = ws
+        self.queue = asyncio.queues.PriorityQueue()      # 任务队列
+        self._send_queue: asyncio.queues.Queue = ...     # 独立发送队列
+        self._send_task: Optional[asyncio.Task] = None   # 发送 worker 任务
+
+    async def _send_worker(self):
+        """独立的发送 worker，从发送队列中取出消息并串行发送"""
+        while True:
+            coro = await asyncio.wait_for(self._send_queue.get(), timeout=1.0)
+            await coro
+            self._send_queue.task_done()
+
+    def start_send_worker(self):
+        """启动独立的发送 worker（在 WebSocket 连接时调用）"""
+        self._send_task = asyncio.create_task(self._send_worker())
+
+    async def target_send(self, ...):
+        """发送消息（通过发送队列串行化）"""
+        # ... 消息处理逻辑 ...
+        if self.bot:
+            body = msgjson.encode(send)
+            ws = self.bot
+            async def _do_send(ws=ws, body=body):
+                await ws.send_bytes(body)
+            await self._enqueue_send(_do_send())
+```
+
+> **设计目的**：所有 WebSocket 写入操作通过 `_send_queue` 串行化执行，
+> 避免 AI 回复、Heartbeat 主动发言、定时任务等多个任务同时写入 WebSocket 导致帧乱序或连接不稳定。
+
 ---
 
-## 八、启动检查清单
+## 九、启动检查清单
 
 | 步骤 | 操作 | 文件 |
 |------|------|------|
@@ -489,12 +651,19 @@ if ENABLE_HTTP:
 | 3 | 依赖安装 | `server.py::check_pyproject()` → `process_dependencies()` |
 | 4 | 模块导入 | `server.py::cached_import()` |
 | 5 | 配置合并 | `config.py::CoreConfig.update_config()` |
-| 6 | WebSocket 服务 | `core.py::websocket_endpoint()` |
-| 7 | HTTP 服务 (可选) | `core.py::sendMsg()` |
+| 6 | **Core Start钩子** | `server.py::core_start_def` |
+| 7 | **RAG初始化** (priority=0) | `ai_core/rag/startup.py::init_all()` |
+| 8 | **Persona初始化** (priority=0) | `ai_core/persona/startup.py::init_default_personas()` |
+| 9 | **Memory系统初始化** (priority=5) | `ai_core/memory/startup.py::init_memory_system()` — 启动 IngestionWorker 独立线程 |
+| 10 | **AI统计初始化** (priority=10) | `ai_core/statistics/startup.py::init_ai_core_statistics()` — HistoryManager清理 + Heartbeat巡检 |
+| 11 | WebSocket服务 | `core.py::websocket_endpoint()` |
+| 12 | HTTP服务 (可选) | `core.py::sendMsg()` |
 
 ---
 
-## 九、开发模式
+## 十、开发模式
+
+### 10.1 启动参数
 
 ```bash
 # 启动开发模式 (只加载 -dev 后缀插件)
@@ -503,14 +672,62 @@ python -m gsuid_core --dev
 # 指定端口
 python -m gsuid_core --port 8888
 
-# 指定地址
+# 指定地址 (0.0.0.0 = 监听全部地址)
 python -m gsuid_core --host 0.0.0.0
+
+# 组合使用
+python -m gsuid_core --dev --port 8888 --host 0.0.0.0
 ```
 
+### 10.2 开发模式区别
+
 ```python
-# 开发模式区别
+# server.py::load_plugins()
 if dev_mode:
     # 只加载 name.endswith("-dev") 的插件
     if not plugin.name.endswith("-dev"):
         continue
+```
+
+### 10.3 开发模式插件命名
+
+```
+# 普通插件（开发模式不加载）
+gsuid_core/plugins/my_plugin/__init__.py
+
+# 开发模式插件
+gsuid_core/plugins/my_plugin-dev/__init__.py
+```
+
+---
+
+## 十一、启动失败排查
+
+### 11.1 常见错误
+
+| 错误 | 可能原因 | 解决方案 |
+|------|----------|----------|
+| `ModuleNotFoundError` | 依赖未安装 | 检查pyproject.toml或手动pip install |
+| `Port already in use` | 端口被占用 | 更换端口或关闭占用进程 |
+| `WS_TOKEN` 警告 | 未配置WebSocket令牌 | 配置WS_TOKEN或仅本地访问 |
+| 数据库连接失败 | 数据库文件权限问题 | 检查数据目录权限 |
+
+### 11.2 日志查看
+
+```bash
+# 查看实时日志
+tail -f logs/gsuid_core.log
+
+# 查看ERROR级别日志
+grep ERROR logs/gsuid_core.log
+```
+
+### 11.3 健康检查
+
+```bash
+# 检查Web服务是否正常
+curl http://localhost:8765/api/system/info
+
+# 检查WebSocket连接
+ws://localhost:8765/ws/test_bot?token=<WS_TOKEN>
 ```

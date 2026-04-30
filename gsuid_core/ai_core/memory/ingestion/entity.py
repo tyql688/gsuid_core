@@ -1,0 +1,66 @@
+"""Entity 去重与写入模块
+
+处理 LLM 提取出的 Entity 列表，两阶段去重后写入数据库和向量库。
+去重策略：
+1. 精确名称匹配（最快，O(1) 索引查询）
+2. 向量语义相似度（处理同义异名，如"爱丽丝"和"Alice"）
+"""
+
+from typing import Optional
+
+from gsuid_core.logger import logger
+from gsuid_core.utils.database.base_models import async_maker
+
+from ..database.models import AIMemEntity
+
+
+async def find_existing_entity(scope_key: str, name: str) -> Optional[AIMemEntity]:
+    return await AIMemEntity.find_existing(scope_key, name)
+
+
+async def extract_and_upsert_entities(
+    scope_key: str,
+    entities_data: list[dict],
+    episode_id: str,
+    speaker_ids: list[str],
+) -> tuple[dict[str, str], int]:
+    """返回 (name_to_id, new_entity_count)"""
+    from gsuid_core.ai_core.memory.vector.ops import upsert_entity_vectors_batch
+
+    async with async_maker() as session:
+        name_to_id, vector_payloads, new_entity_count = await AIMemEntity.extract_and_upsert(
+            session,
+            scope_key,
+            entities_data,
+            episode_id,
+            speaker_ids,
+        )
+        await session.commit()
+
+    # 🔥 批量写 vector（关键点：Qdrant 与 SQL 一致性保障）
+    # OPT-04: 加全局超时保护，避免 Qdrant 超时阻塞整个 ingestion worker
+    if vector_payloads:
+        import asyncio
+
+        async def _upsert_with_retry():
+            for attempt in range(3):
+                try:
+                    await upsert_entity_vectors_batch(vector_payloads)
+                    return True
+                except Exception as e:
+                    if attempt < 2:
+                        delay = 0.5 * (2**attempt)  # 指数退避: 0.5s, 1s
+                        logger.warning(
+                            f"[Qdrant] Entity vector batch upsert failed (retry {attempt + 1}/3, wait {delay}s): {e}"
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(f"[Qdrant] Entity vector batch upsert failed after 3 retries: {e}")
+                        return False
+
+        try:
+            await asyncio.wait_for(_upsert_with_retry(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.error("[Qdrant] Entity vector batch upsert global timeout (30s)")
+
+    return name_to_id, new_entity_count
